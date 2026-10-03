@@ -2,80 +2,74 @@
   <img src="./assets/image.png" alt="Zotero Paper Partner icon" width="120">
 </p>
 
-# Zotero Paper Partner
+# Zotero Paper Partner · Enhanced Fork
 
 A Zotero plugin that answers `Q:` questions you write inside notes — silently, in the background, without breaking your reading flow.
+
+**This fork makes it actually read your PDFs.** The upstream plugin only saw whatever you had copied into your notes, silently failed on Kimi-style APIs, and broke on Zotero 9. This fork fixes all of that and adds a visible status machine, follow-up memory, and real page citations.
+
+> 🇨🇳 **完整中文说明请看 [README.zh-CN.md](./README.zh-CN.md)**（内容更详细，推荐阅读）
 
 ![Zotero](https://img.shields.io/badge/Zotero-9-E05A47?logo=zotero&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ES6-F7DF1E?logo=javascript&logoColor=000)
 ![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI--compatible-412991?logo=openai&logoColor=white)
-![GitHub Downloads](https://img.shields.io/github/downloads/QinSihan/zotero-paper-partner/total?label=downloads&logo=GitHub)
-![Open Prompt](https://img.shields.io/badge/Open%20Prompt-public-2C7A7B)
-![Vibe Coding](https://img.shields.io/badge/Vibe%20Coding-Agent%20Reproducible-111111)
-
-[中文说明](./README.zh-CN.md)
-
-[![Demo](./assets/demo.gif)](./assets/demo.mp4)
 
 ---
 
-## The idea
+## What changed vs upstream
 
-This plugin is for a very specific moment: you're reading a paper, something doesn't click, and you don't want to stop everything just to ask AI about it.
+| Version | Change | Problem it solves |
+|---|---|---|
+| v0.1.2 | Stop hardcoding `temperature: 0.3` | Kimi models only allow 1.0 — every request was rejected with HTTP 400, surfacing as a silent `A[error]` line |
+| v0.1.3 | PDF full-text injection (`PdfContext` module) | The model only saw your copied notes; everything else was hallucinated from its training memory |
+| v0.1.4 | Zotero 9 compatibility | `Zotero.Fulltext.getItemContent` was removed in Zotero 9 — full-text reading always failed. Now reads the `.zotero-ft-cache` file directly |
+| v0.1.5 | Whole-document injection + `[page N]` markers | Keyword-based selection fails for cross-language Q&A; page citations were guessed. PDFs ≤50k chars are now attached in full |
+| v0.1.6 | Settings page / follow-up memory / BM25 selection | No continuity between questions; poor selection for long documents. Adds Temperature & Max Tokens settings |
+| v0.1.7 | Status machine / answer-only budget / Kimi temperature adaptation / native timeout | Dead connections froze `A[running]` forever; reasoning burned the whole token budget; Kimi pins temperature per thinking mode |
 
-So instead of opening a chat window, pasting context, and breaking your flow, you just type a `Q:` in the Zotero note you're already writing. Then you keep going. A little later, the answer shows up right under the question.
+## How it works now
 
 ```
-The model uses a representation-agnostic objective.
-Q: What does representation-agnostic mean here?
+You type in a note:      Q: What does section 2 claim about COVID?
 
-A[done]: It means the method does not depend on a specific internal representation,
-but works across different ways of encoding the same underlying information.
+The note shows:          A[reading]:    ← locates the PDF, reads full text (indexes on first use)
+                         A[thinking]:   ← full text + note context + recent Q/A sent to the LLM
+                         A[done]: Section 2 (§2, [page 3]) argues that voluntary rapid
+                                  deployment "super-charged the rate of discovery" ...
 ```
 
-That's really the whole idea: keep the question, the context, and the answer in one place, and don't make reading feel heavier than it already is.
+- PDFs ≤ 50,000 characters are attached **in full**; larger ones fall back to BM25 chunk selection
+- Answers cite real `[page N]` markers instead of guessing
+- Follow-ups ("what about section 3?") work via the last 2-3 Q/A pairs from the same note
+- Empty/cut-off answers automatically retry once with a doubled budget
+- Dead connections abort after 180-240s (scales with the answer budget) instead of hanging forever
 
-## Why it feels different
+## Best suited for
 
-**Stay in the note.** Most AI reading tools ask you to step out of your notes and into some other interface. This one doesn't. The question lives in your note, the answer comes back to that same note, and what you end up with is still just a normal reading note you can keep.
+- Zotero 7+ (tested on 9.0.6) with any OpenAI-compatible API (Kimi, DeepSeek, …)
+- Asking questions in one language about papers written in another (e.g. Chinese questions, English papers)
+- Paragraph/section-level comprehension, term explanation, "quote the original and tell me where it says so"
+- Quiet, no-popup reading flow — one question, one call, no chat window
 
-**Don't break the flow.** You write `Q:`, press Enter, and move on. The plugin waits a moment, works in the background, and fills in the answer when it's ready. If you change the note while it's working, it marks the result as stale instead of pretending the old answer is still valid.
-
-**Any coding Agent can reproduce.** If you want to rebuild or extend it, this repo includes [`target.md`](./target.md), which is basically the original spec that shaped the whole plugin. You can hand that file to a coding agent and get a solid reproduction path without having to reverse-engineer the idea from scratch.
-
----
+**Not ideal for:** multi-step mathematical reasoning (deep thinking is off by default; re-enable via the `thinking` pref), documents > 50k characters (falls back to selection — pair it with manual excerpts), or agent-style multi-turn browsing.
 
 ## Install
 
-Download `paper-partner.xpi` from GitHub Releases, then in Zotero: `Tools → Plugins → Install Add-on From File`.
+1. Download `dist/paper-partner-0.1.7.xpi`
+2. Zotero → Tools → Plugins → gear icon → **Install Plugin From File**
+3. Restart Zotero
 
-## Configure
+> When upgrading: remove the old version first, restart, then install the new one from file.
 
-`Zotero Preferences → Paper Partner` — set your API key, endpoint, model, answer mode, and trigger delay. Defaults to DeepSeek's OpenAI-compatible API.
+## Configuration (Zotero Settings → Paper Partner)
 
-## Q&A
+| Setting | Notes |
+|---|---|
+| API Endpoint | Full chat/completions URL, e.g. `https://api.kimi.com/coding/v1/chat/completions` (Kimi) or `https://api.deepseek.com/v1/chat/completions` (DeepSeek) |
+| API Key / Model | From your provider, e.g. model `k3` (Kimi) or `deepseek-chat` |
+| Temperature | Only sent to providers that accept it — Kimi pins its own temperature per thinking mode, so this fork omits the field there |
+| Max Tokens | Caps the **visible answer** only (Auto = 3000); reasoning headroom is added separately |
 
-**Which APIs are supported?**  
-Paper Partner calls an OpenAI-compatible Chat Completions endpoint. DeepSeek works by default, and services such as OpenAI, Kimi/Moonshot, Alibaba Bailian DashScope, SiliconFlow, and OpenRouter can usually work by filling in their endpoint and model name. Provider presets are not built in yet.
+## Credits & license
 
-**What should I put in API Endpoint?**  
-Use the full chat completions URL, for example `https://api.deepseek.com/v1/chat/completions`. If a provider's docs only show a `base_url`, you usually need to append `/chat/completions`.
-
-**What is the difference between Brief and Detailed?**  
-Brief is designed to avoid breaking your reading flow: it only explains the term or sentence you asked about, and keeps the answer very short. Detailed gives a fuller explanation of the concept, mechanism, and causal relationship, but still does not summarize the whole paper.
-
-**What is Trigger Delay?**  
-It controls how long the plugin waits after you press Enter into a new paragraph before it starts processing the question. Immediate is 0 seconds, Short is 1 second, Medium is 2 seconds, and Long is 3 seconds.
-
-**Why do I see `A[error]: ...`?**  
-This means the plugin received an API error, an empty response, or a model response that was cut off by the token limit. Delete the `A[error]: ...` line, then slightly rephrase the question or shorten the context and press Enter again to trigger a new request.
-
-## Requirements
-
-Zotero 7+ (tested on Zotero 9). Any OpenAI-compatible API endpoint works.
-
----
-
-## Note
-
-This project was built with a very heavy dose of vibe coding, honestly something like 99% of it. The core prompt/spec is public in [`target.md`](./target.md), so the project is not just open source, but also fairly open-prompt.
+Original idea, design and `target.md` spec by [Sihan Qin](https://github.com/QinSihan) ([upstream repo](https://github.com/QinSihan/zotero-paper-partner)). All changes in this fork are documented commit-by-commit in [CHANGELOG.md](./CHANGELOG.md). Rights to the original project remain with the upstream author; this fork is for personal study and research.
