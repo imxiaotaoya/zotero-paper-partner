@@ -274,7 +274,10 @@ const PdfContext = {
     async collect(item, questionText, contextText) {
         try {
             const text = await this._getPdfText(item);
-            if (!text || text.length < 200) return "";
+            if (!text || text.length < 200) {
+                Zotero.debug("[PaperPartner] PDF context: no usable fulltext (chars=" + (text ? text.length : 0) + ")");
+                return "";
+            }
             const out = this._select(text.slice(0, this.maxTextChars), questionText, contextText);
             Zotero.debug("[PaperPartner] PDF context: source_chars=" + text.length + ", excerpt_chars=" + out.length);
             return out;
@@ -284,9 +287,25 @@ const PdfContext = {
         }
     },
 
+    async _readFulltextCache(att) {
+        const paths = [];
+        try { paths.push(Zotero.Fulltext.getItemCacheFile(att).path + ""); } catch (_) {}
+        try {
+            const p = await att.getFilePathAsync();
+            if (p) paths.push(p.replace(/[\\/][^\\/]*$/, "") + "/.zotero-ft-cache");
+        } catch (_) {}
+        for (const p of paths) {
+            try {
+                const text = await Zotero.File.getContentsAsync(p);
+                if (typeof text === "string" && text.length > 200) return text;
+            } catch (_) {}
+        }
+        return "";
+    },
+
     async _getPdfText(item) {
         const parentID = item.parentID;
-        if (!parentID) return "";
+        if (!parentID) { Zotero.debug("[PaperPartner] PDF context: note has no parent item"); return ""; }
         const parent = Zotero.Items.get(parentID);
         if (!parent || !parent.isRegularItem || !parent.isRegularItem()) return "";
 
@@ -300,15 +319,14 @@ const PdfContext = {
                 }
             } catch (_) {}
         }
-        if (!att) return "";
+        if (!att) { Zotero.debug("[PaperPartner] PDF context: no PDF attachment on the parent item"); return ""; }
 
-        let text = null;
-        try { text = await Zotero.Fulltext.getItemContent(att.id); } catch (_) {}
-        if (!text || typeof text !== "string" || text.length < 200) {
+        let text = await this._readFulltextCache(att);
+        if (!text) {
             try {
                 Zotero.debug("[PaperPartner] Indexing PDF for fulltext: attachment " + att.id);
                 await Zotero.Fulltext.indexItems([att.id]);
-                text = await Zotero.Fulltext.getItemContent(att.id);
+                text = await this._readFulltextCache(att);
             } catch (e) {
                 Zotero.debug("[PaperPartner] Fulltext indexing failed: " + e.message);
                 return "";
