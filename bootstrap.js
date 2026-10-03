@@ -197,6 +197,153 @@ const NoteWriter = {
 };
 
 // ============================================================
+// PDF CONTEXT
+// Adds the parent item's PDF to the model's context: fetch the
+// fulltext (Zotero fulltext index, indexing on demand), score
+// chunks against the question + note context, and keep the most
+// relevant ones plus the title/abstract region.
+// ============================================================
+const PdfContext = {
+    maxTextChars: 400000,
+    maxChars: 4500,
+    chunkTarget: 1200,
+    maxChunks: 4,
+
+    _asciiStop: new Set(("the and for with this that are was were have has had you your about into from will would can could should "
+        + "what when where how why who does did done its his her their there here been being also than then them they which "
+        + "these those over under between each other more most some such only very just like make made use used using give "
+        + "help please tell explain summarize summary pdf paper article text note notes section part parts figure table").split(" ")),
+
+    _cjkStop: new Set(["什么", "这个", "那个", "哪些", "这些", "那些", "为什", "怎么", "怎样", "可以",
+        "我们", "你们", "自己", "就是", "还是", "但是", "可是", "如果", "因为", "所以", "然后",
+        "于是", "这样", "那样", "一下", "一些", "以及", "或者", "并且", "而且", "不过", "只是",
+        "只有", "所有", "没有", "不能", "已经", "正在", "这里", "那里", "哪个", "每个", "某个"]),
+
+    _terms(s, cap) {
+        const terms = [];
+        const seen = new Set();
+        const lower = String(s || "").toLowerCase();
+        for (const w of lower.match(/[a-z][a-z0-9'-]+/g) || []) {
+            if (this._asciiStop.has(w) || seen.has(w)) continue;
+            seen.add(w);
+            terms.push(w);
+            if (terms.length >= cap) return terms;
+        }
+        for (const run of lower.match(/[\u4e00-\u9fff]+/g) || []) {
+            for (let i = 0; i < run.length - 1; i++) {
+                const bg = run.slice(i, i + 2);
+                if (this._cjkStop.has(bg) || seen.has(bg)) continue;
+                seen.add(bg);
+                terms.push(bg);
+                if (terms.length >= cap) return terms;
+            }
+        }
+        return terms;
+    },
+
+    _score(chunkLower, terms, weight) {
+        let s = 0;
+        for (const t of terms) {
+            let n = 0, i = 0;
+            while ((i = chunkLower.indexOf(t, i)) !== -1) { n++; i += t.length; }
+            if (n) s += weight * n;
+        }
+        return s;
+    },
+
+    _chunk(text) {
+        const paras = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+        const chunks = [];
+        let cur = "";
+        for (let p of paras) {
+            while (p.length > this.chunkTarget * 2) {
+                chunks.push(p.slice(0, this.chunkTarget));
+                p = p.slice(this.chunkTarget);
+            }
+            if (cur && cur.length + p.length + 1 > this.chunkTarget) {
+                chunks.push(cur);
+                cur = p;
+            } else {
+                cur = cur ? cur + "\n" + p : p;
+            }
+        }
+        if (cur) chunks.push(cur);
+        return chunks;
+    },
+
+    async collect(item, questionText, contextText) {
+        try {
+            const text = await this._getPdfText(item);
+            if (!text || text.length < 200) return "";
+            const out = this._select(text.slice(0, this.maxTextChars), questionText, contextText);
+            Zotero.debug("[PaperPartner] PDF context: source_chars=" + text.length + ", excerpt_chars=" + out.length);
+            return out;
+        } catch (e) {
+            Zotero.debug("[PaperPartner] PDF context unavailable: " + e.message);
+            return "";
+        }
+    },
+
+    async _getPdfText(item) {
+        const parentID = item.parentID;
+        if (!parentID) return "";
+        const parent = Zotero.Items.get(parentID);
+        if (!parent || !parent.isRegularItem || !parent.isRegularItem()) return "";
+
+        let att = null;
+        try { att = await parent.getBestAttachment(); } catch (_) {}
+        if (!att || att.attachmentContentType !== "application/pdf") {
+            try {
+                for (const id of await parent.getAttachments()) {
+                    const a = Zotero.Items.get(id);
+                    if (a && a.isAttachment && a.attachmentContentType === "application/pdf") { att = a; break; }
+                }
+            } catch (_) {}
+        }
+        if (!att) return "";
+
+        let text = null;
+        try { text = await Zotero.Fulltext.getItemContent(att.id); } catch (_) {}
+        if (!text || typeof text !== "string" || text.length < 200) {
+            try {
+                Zotero.debug("[PaperPartner] Indexing PDF for fulltext: attachment " + att.id);
+                await Zotero.Fulltext.indexItems([att.id]);
+                text = await Zotero.Fulltext.getItemContent(att.id);
+            } catch (e) {
+                Zotero.debug("[PaperPartner] Fulltext indexing failed: " + e.message);
+                return "";
+            }
+        }
+        return (typeof text === "string") ? text : "";
+    },
+
+    _select(text, questionText, contextText) {
+        const chunks = this._chunk(text);
+        if (!chunks.length) return "";
+        const qT = this._terms(questionText, 100);
+        const cT = this._terms(contextText, 60);
+
+        const scored = chunks.map((c, i) => {
+            const cl = c.toLowerCase();
+            const s = (this._score(cl, qT, 2) + this._score(cl, cT, 1)) / Math.sqrt(c.length + 1);
+            return { i, c, s };
+        });
+
+        const picked = [{ i: 0, c: chunks[0] }];
+        let total = chunks[0].length;
+        const rest = scored.slice(1).sort((a, b) => b.s - a.s);
+        for (const r of rest) {
+            if (picked.length >= this.maxChunks || r.s <= 0) break;
+            if (total + r.c.length > this.maxChars) continue;
+            picked.push(r);
+            total += r.c.length;
+        }
+        picked.sort((a, b) => a.i - b.i);
+        return picked.map(p => p.c).join("\n\n[...]\n\n");
+    },
+};
+
+// ============================================================
 // API CLIENT
 // OpenAI-compatible chat completion. DeepSeek by default.
 // ============================================================
@@ -230,7 +377,7 @@ const ApiClient = {
         },
     },
 
-    _buildMessages(questionText, contextText, mode) {
+    _buildMessages(questionText, contextText, mode, pdfExcerpts) {
         const config = this._modes[mode] || this._modes.brief;
         const userMessage = contextText
             ? `Context from my reading notes:\n${contextText}\n\nQuestion: ${questionText}`
@@ -242,6 +389,12 @@ const ApiClient = {
             messages: [
                 { role: "system", content: config.systemPrompt },
                 { role: "user", content: config.userInstruction },
+                ...(pdfExcerpts ? [{
+                    role: "user",
+                    content: "Excerpts from the PDF that this note is attached to (selected automatically; may be incomplete):\n\n"
+                        + pdfExcerpts
+                        + "\n\nUse these excerpts when they help answer the question. If the answer is not in them, say so from general knowledge without claiming the PDF contains it.",
+                }] : []),
                 { role: "user", content: userMessage },
             ],
         };
@@ -276,11 +429,11 @@ const ApiClient = {
         ].join(", ");
     },
 
-    async query(questionText, contextText) {
+    async query(questionText, contextText, pdfExcerpts) {
         const endpoint = getPref("apiEndpoint");
         const model = getPref("model");
         const mode = getAnswerMode();
-        const request = this._buildMessages(questionText, contextText, mode);
+        const request = this._buildMessages(questionText, contextText, mode, pdfExcerpts);
 
         Zotero.debug(
             "[PaperPartner] API request: host=" + getEndpointHost(endpoint) +
@@ -288,7 +441,8 @@ const ApiClient = {
             ", mode=" + mode +
             ", max_tokens=" + request.maxTokens +
             ", instruction_length=" + request.instruction.length +
-            ", message_count=" + request.messages.length
+            ", message_count=" + request.messages.length +
+            ", pdf_excerpt_chars=" + (pdfExcerpts ? pdfExcerpts.length : 0)
         );
 
         const response = await fetch(endpoint, {
@@ -463,7 +617,8 @@ async function processQuestion(item, q) {
     // ② Call the model
     let answer;
     try {
-        answer = await ApiClient.query(questionText, contextText);
+        const pdfExcerpts = await PdfContext.collect(item, questionText, contextText);
+        answer = await ApiClient.query(questionText, contextText, pdfExcerpts);
     } catch (e) {
         Zotero.debug("[PaperPartner] API error: " + e.message);
         await NoteWriter.write(item, el, "error", e.message.slice(0, 120));
