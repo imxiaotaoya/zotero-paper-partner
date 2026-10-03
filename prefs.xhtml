@@ -5,7 +5,10 @@
     apiEndpoint: 'https://api.deepseek.com/v1/chat/completions',
     model: 'deepseek-chat',
     answerMode: 'brief',
-    triggerDelay: 'medium'
+    triggerDelay: 'medium',
+    temperature: '1.0',
+    maxTokens: 'auto',
+    thinking: 'standard'
   };
   Object.keys(DEFAULTS).forEach(function(key) {
     var el = document.getElementById('pp-' + key);
@@ -56,4 +59,36 @@
       <html:option value="long">Long (3s)</html:option>
     </html:select>
   </hbox>
+
+  <hbox align="center" style="margin-top: 6px">
+    <label value="Temperature" style="min-width: 110px"/>
+    <html:select id="pp-temperature" flex="1" style="margin-left: 4px">
+      <html:option value="1.0">1.0 (required by Kimi models)</html:option>
+      <html:option value="0.7">0.7</html:option>
+      <html:option value="0.3">0.3</html:option>
+    </html:select>
+  </hbox>
+
+  <hbox align="center" style="margin-top: 6px">
+    <label value="Max Tokens" style="min-width: 110px"/>
+    <html:select id="pp-maxTokens" flex="1" style="margin-left: 4px">
+      <html:option value="auto">Auto (follow Answer Mode)</html:option>
+      <html:option value="1200">1200</html:option>
+      <html:option value="3000">3000</html:option>
+      <html:option value="6000">6000</html:option>
+      <html:option value="12000">12000</html:option>
+    </html:select>
+  </hbox>
+
+  <hbox align="center" style="margin-top: 6px">
+    <label value="Thinking" style="min-width: 110px"/>
+    <html:select id="pp-thinking" flex="1" style="margin-left: 4px">
+      <html:option value="standard">Standard (deep reasoning)</html:option>
+      <html:option value="disabled">Disabled (fast, no reasoning)</html:option>
+    </html:select>
+  </hbox>
+
+  <label style="margin-top: 8px; font-size: 11px; opacity: 0.75">
+    Note: Kimi models only allow temperature 1.0. On reasoning models (e.g. k3), Max Tokens caps thinking and answer together - if an answer comes back empty it is retried once with a doubled budget.
+  </label>
 </groupbox>

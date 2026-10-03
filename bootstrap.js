@@ -22,6 +22,9 @@ const PREF_DEFAULTS = {
     model:       "deepseek-chat",
     answerMode:  "brief",
     triggerDelay: "medium",
+    temperature: "1.0",
+    maxTokens:   "auto",
+    thinking:    "standard",
 };
 
 /** Read a user-configurable preference, falling back to PREF_DEFAULTS. */
@@ -121,6 +124,7 @@ const NoteParser = {
                 questionText: items[i].text,
                 contextText: contextParts.join("\n").slice(0, CONFIG.maxContextLength),
                 el: items[i].el,
+                index: items[i].index,
             });
         }
 
@@ -133,6 +137,35 @@ const NoteParser = {
      */
     fingerprint(questionText, contextText) {
         return questionText + "\x00" + contextText;
+    },
+
+    /**
+     * Collect the last few answered Q/A pairs above the given question
+     * (parsed item array), for continuity on follow-up questions.
+     */
+    buildHistory(items, questionIndex) {
+        const pairs = [];
+        let curQ = null;
+        for (let i = 0; i < questionIndex && i < items.length; i++) {
+            const it = items[i];
+            if (it.type === "question") {
+                curQ = it.text;
+            } else if (it.type === "answer" && curQ) {
+                if (it.status === "done" && it.content) {
+                    pairs.push({ q: curQ, a: it.content });
+                }
+                curQ = null;
+            }
+        }
+        const picked = [];
+        let total = 0;
+        for (let i = pairs.length - 1; i >= 0 && picked.length < 3; i--) {
+            const chunk = "Q: " + pairs[i].q.slice(0, 200) + "\nA: " + pairs[i].a.slice(0, 500);
+            if (total + chunk.length > 1500) break;
+            picked.unshift(chunk);
+            total += chunk.length;
+        }
+        return picked.join("\n\n");
     },
 };
 
@@ -206,9 +239,9 @@ const NoteWriter = {
 const PdfContext = {
     maxTextChars: 400000,
     maxFullChars: 50000,
-    maxChars: 4500,
-    chunkTarget: 1200,
-    maxChunks: 4,
+    maxChars: 16000,
+    chunkTarget: 1600,
+    maxChunks: 10,
 
     _asciiStop: new Set(("the and for with this that are was were have has had you your about into from will would can could should "
         + "what when where how why who does did done its his her their there here been being also than then them they which "
@@ -240,16 +273,6 @@ const PdfContext = {
             }
         }
         return terms;
-    },
-
-    _score(chunkLower, terms, weight) {
-        let s = 0;
-        for (const t of terms) {
-            let n = 0, i = 0;
-            while ((i = chunkLower.indexOf(t, i)) !== -1) { n++; i += t.length; }
-            if (n) s += weight * n;
-        }
-        return s;
     },
 
     _chunk(text) {
@@ -350,10 +373,41 @@ const PdfContext = {
         if (!chunks.length) return "";
         const qT = this._terms(questionText, 100);
         const cT = this._terms(contextText, 60);
+        const weights = new Map();
+        for (const t of cT) weights.set(t, 1);
+        for (const t of qT) weights.set(t, (weights.get(t) || 0) + 2);
+        const terms = [...weights.keys()];
+        if (!terms.length) return chunks[0];
+
+        const N = chunks.length;
+        const lower = chunks.map(c => c.toLowerCase());
+        const avgLen = lower.reduce((s, c) => s + c.length, 0) / N;
+        const k1 = 1.2, b = 0.75;
+
+        // BM25-style scoring: document frequency downweights terms that
+        // appear everywhere, so rare on-topic terms dominate the ranking.
+        const df = new Map();
+        for (const t of terms) {
+            let n = 0;
+            for (const cl of lower) {
+                if (cl.indexOf(t) !== -1) n++;
+            }
+            df.set(t, n);
+        }
 
         const scored = chunks.map((c, i) => {
-            const cl = c.toLowerCase();
-            const s = (this._score(cl, qT, 2) + this._score(cl, cT, 1)) / Math.sqrt(c.length + 1);
+            const cl = lower[i];
+            const lenNorm = k1 * (1 - b + b * (cl.length / avgLen));
+            let s = 0;
+            for (const t of terms) {
+                const idf = df.get(t);
+                if (!idf) continue;
+                const idfv = Math.log(1 + (N - idf + 0.5) / (idf + 0.5));
+                let tf = 0, pos = 0;
+                while ((pos = cl.indexOf(t, pos)) !== -1) { tf++; pos += t.length; }
+                if (!tf) continue;
+                s += weights.get(t) * idfv * (tf * (k1 + 1)) / (tf + lenNorm);
+            }
             return { i, c, s };
         });
 
@@ -405,7 +459,7 @@ const ApiClient = {
         },
     },
 
-    _buildMessages(questionText, contextText, mode, pdfExcerpts) {
+    _buildMessages(questionText, contextText, mode, pdfExcerpts, history) {
         const config = this._modes[mode] || this._modes.brief;
         const userMessage = contextText
             ? `Context from my reading notes:\n${contextText}\n\nQuestion: ${questionText}`
@@ -423,9 +477,25 @@ const ApiClient = {
                         + pdfExcerpts
                         + "\n\nUse these excerpts when they help answer the question. If the answer is not in them, say so from general knowledge without claiming the PDF contains it.",
                 }] : []),
+                ...(history ? [{
+                    role: "user",
+                    content: "Earlier questions and answers from this same note (oldest first, for continuity):\n\n" + history,
+                }] : []),
                 { role: "user", content: userMessage },
             ],
         };
+    },
+
+    _resolveSettings(mode) {
+        const config = this._modes[mode] || this._modes.brief;
+        let maxTokens = config.maxTokens;
+        const prefTokens = parseInt(getPref("maxTokens"), 10);
+        if (!isNaN(prefTokens) && prefTokens >= 256) maxTokens = prefTokens;
+        let temperature = parseFloat(getPref("temperature"));
+        if (isNaN(temperature)) temperature = 1;
+        temperature = Math.min(2, Math.max(0, temperature));
+        const thinking = getPref("thinking") === "disabled" ? "disabled" : "standard";
+        return { maxTokens, temperature, thinking };
     },
 
     _normalizeContent(content) {
@@ -457,58 +527,77 @@ const ApiClient = {
         ].join(", ");
     },
 
-    async query(questionText, contextText, pdfExcerpts) {
+    async query(questionText, contextText, pdfExcerpts, history) {
         const endpoint = getPref("apiEndpoint");
         const model = getPref("model");
         const mode = getAnswerMode();
-        const request = this._buildMessages(questionText, contextText, mode, pdfExcerpts);
+        const request = this._buildMessages(questionText, contextText, mode, pdfExcerpts, history);
+        const settings = this._resolveSettings(mode);
 
         Zotero.debug(
             "[PaperPartner] API request: host=" + getEndpointHost(endpoint) +
             ", model=" + model +
             ", mode=" + mode +
-            ", max_tokens=" + request.maxTokens +
-            ", instruction_length=" + request.instruction.length +
+            ", max_tokens=" + settings.maxTokens +
+            ", temperature=" + settings.temperature +
+            ", thinking=" + settings.thinking +
             ", message_count=" + request.messages.length +
-            ", pdf_excerpt_chars=" + (pdfExcerpts ? pdfExcerpts.length : 0)
+            ", pdf_chars=" + (pdfExcerpts ? pdfExcerpts.length : 0) +
+            ", history_chars=" + (history ? history.length : 0)
         );
 
-        const response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${getPref("apiKey")}`,
-            },
-            body: JSON.stringify({
-                model,
-                messages: request.messages,
-                max_tokens: request.maxTokens,
-                temperature: 1,
-            }),
-        });
+        // One automatic retry with a doubled token budget when the response
+        // was cut off (reasoning models can spend the whole budget thinking).
+        let limit = settings.maxTokens;
+        for (let attempt = 0; ; attempt++) {
+            const r = await this._call(endpoint, model, request, limit, settings.temperature, settings.thinking);
+            if (r.ok) return r.content;
+            if (!(r.retryable && attempt === 0 && limit < 32768)) throw new Error(r.error);
+            limit = Math.min(limit * 2, 32768);
+            Zotero.debug("[PaperPartner] Retrying with max_tokens=" + limit + ": " + r.error);
+        }
+    },
+
+    async _call(endpoint, model, request, maxTokens, temperature, thinking) {
+        const body = {
+            model,
+            messages: request.messages,
+            max_tokens: maxTokens,
+            temperature,
+        };
+        if (thinking === "disabled") body.thinking = { type: "disabled" };
+
+        let response;
+        try {
+            response = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${getPref("apiKey")}`,
+                },
+                body: JSON.stringify(body),
+            });
+        } catch (e) {
+            return { ok: false, retryable: false, error: "Network error: " + e.message };
+        }
 
         if (!response.ok) {
-            const body = await response.text().catch(() => "");
+            const errBody = await response.text().catch(() => "");
             Zotero.debug(
                 "[PaperPartner] API HTTP error: host=" + getEndpointHost(endpoint) +
                 ", model=" + model +
                 ", status=" + response.status +
-                ", body=" + body.slice(0, 500)
+                ", body=" + errBody.slice(0, 500)
             );
-            throw new Error(`HTTP ${response.status}: ${body.slice(0, 200)}`);
+            return { ok: false, retryable: false, error: `HTTP ${response.status}: ${errBody.slice(0, 200)}` };
         }
 
         let data;
         try {
             data = await response.json();
         } catch (e) {
-            Zotero.debug(
-                "[PaperPartner] API JSON parse error: host=" + getEndpointHost(endpoint) +
-                ", model=" + model +
-                ", status=" + response.status +
-                ", error=" + e.message
-            );
-            throw new Error("Invalid JSON from API");
+            Zotero.debug("[PaperPartner] API JSON parse error: " + e.message);
+            return { ok: false, retryable: false, error: "Invalid JSON from API" };
         }
 
         const choice = data && data.choices && data.choices[0];
@@ -516,35 +605,28 @@ const ApiClient = {
         const content = message ? this._normalizeContent(message.content) : "";
         const finishReason = choice && choice.finish_reason ? choice.finish_reason : "unknown";
 
-        if (!content) {
-            Zotero.debug(
-                "[PaperPartner] Empty API response: host=" + getEndpointHost(endpoint) +
-                ", model=" + model +
-                ", status=" + response.status +
-                ", " + this._summarizeChoice(choice)
-            );
-            throw new Error("Empty response from API (finish_reason=" + finishReason + ")");
+        if (finishReason === "length") {
+            Zotero.debug("[PaperPartner] API hit the token limit: " + this._summarizeChoice(choice));
+            return {
+                ok: false,
+                retryable: true,
+                error: content
+                    ? "Response was cut off by the token limit (finish_reason=length)"
+                    : "Empty response: the token limit was consumed by reasoning (finish_reason=length)",
+            };
         }
 
-        if (finishReason === "length") {
-            Zotero.debug(
-                "[PaperPartner] API response was cut off: host=" + getEndpointHost(endpoint) +
-                ", model=" + model +
-                ", status=" + response.status +
-                ", " + this._summarizeChoice(choice)
-            );
-            throw new Error("Response was cut off by the token limit (finish_reason=length)");
+        if (!content) {
+            Zotero.debug("[PaperPartner] Empty API response: " + this._summarizeChoice(choice));
+            return { ok: false, retryable: false, error: "Empty response from API (finish_reason=" + finishReason + ")" };
         }
 
         Zotero.debug(
-            "[PaperPartner] API response OK: host=" + getEndpointHost(endpoint) +
-            ", model=" + model +
-            ", status=" + response.status +
+            "[PaperPartner] API response OK: status=" + response.status +
             ", finish_reason=" + finishReason +
             ", content_length=" + content.length
         );
-
-        return content;
+        return { ok: true, content };
     },
 };
 
@@ -646,7 +728,8 @@ async function processQuestion(item, q) {
     let answer;
     try {
         const pdfExcerpts = await PdfContext.collect(item, questionText, contextText);
-        answer = await ApiClient.query(questionText, contextText, pdfExcerpts);
+        const history = NoteParser.buildHistory(NoteParser.parse(item.getNote()), q.index);
+        answer = await ApiClient.query(questionText, contextText, pdfExcerpts, history);
     } catch (e) {
         Zotero.debug("[PaperPartner] API error: " + e.message);
         await NoteWriter.write(item, el, "error", e.message.slice(0, 120));
