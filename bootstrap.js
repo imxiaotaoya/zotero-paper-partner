@@ -7,6 +7,9 @@
 // ============================================================
 const CONFIG = {
     maxContextLength: 2000, // Max chars of context sent to the model
+    requestTimeoutMs: 180000, // Timeout floor; grows with the answer budget below
+    timeoutMsPerToken: 40, // Extra timeout per max_token so big budgets are not killed mid-generation
+    thinkingHeadroomTokens: 8000, // Only used when thinking is manually re-enabled ("standard")
     triggerDelays: {
         immediate: 0,
         short: 1000,
@@ -24,7 +27,7 @@ const PREF_DEFAULTS = {
     triggerDelay: "medium",
     temperature: "1.0",
     maxTokens:   "auto",
-    thinking:    "standard",
+    thinking:    "disabled",
 };
 
 /** Read a user-configurable preference, falling back to PREF_DEFAULTS. */
@@ -52,6 +55,13 @@ function getEndpointHost(endpoint) {
     } catch (_) {
         return "invalid-endpoint";
     }
+}
+
+function isTemperaturelessProvider(endpoint) {
+    // Kimi/Moonshot endpoints pin temperature to the thinking mode
+    // (1.0 with reasoning, 0.6 without) and reject every other value.
+    const host = getEndpointHost(endpoint);
+    return /(^|\.)(kimi\.com|moonshot\.cn|moonshot\.ai)$/.test(host);
 }
 
 let rootURI = "";
@@ -295,9 +305,9 @@ const PdfContext = {
         return chunks;
     },
 
-    async collect(item, questionText, contextText) {
+    async collect(item, questionText, contextText, onInfo) {
         try {
-            const text = await this._getPdfText(item);
+            const text = await this._getPdfText(item, onInfo);
             if (!text || text.length < 200) {
                 Zotero.debug("[PaperPartner] PDF context: no usable fulltext (chars=" + (text ? text.length : 0) + ")");
                 return "";
@@ -332,7 +342,7 @@ const PdfContext = {
         return "";
     },
 
-    async _getPdfText(item) {
+    async _getPdfText(item, onInfo) {
         const parentID = item.parentID;
         if (!parentID) { Zotero.debug("[PaperPartner] PDF context: note has no parent item"); return ""; }
         const parent = Zotero.Items.get(parentID);
@@ -354,6 +364,7 @@ const PdfContext = {
         if (!text) {
             try {
                 Zotero.debug("[PaperPartner] Indexing PDF for fulltext: attachment " + att.id);
+                if (onInfo) { try { onInfo("正在为这篇 PDF 建立全文索引（首次，约 10-30 秒）"); } catch (_) {} }
                 await Zotero.Fulltext.indexItems([att.id]);
                 text = await this._readFulltextCache(att);
             } catch (e) {
@@ -487,15 +498,17 @@ const ApiClient = {
     },
 
     _resolveSettings(mode) {
-        const config = this._modes[mode] || this._modes.brief;
-        let maxTokens = config.maxTokens;
+        // "Max Tokens" caps the visible answer only. Reasoning is off by
+        // default (fast, no overthinking); set the "thinking" pref to
+        // "standard" manually to re-enable it with a fixed headroom.
+        let answerTokens = 3000;
         const prefTokens = parseInt(getPref("maxTokens"), 10);
-        if (!isNaN(prefTokens) && prefTokens >= 256) maxTokens = prefTokens;
+        if (!isNaN(prefTokens) && prefTokens >= 256) answerTokens = prefTokens;
         let temperature = parseFloat(getPref("temperature"));
         if (isNaN(temperature)) temperature = 1;
         temperature = Math.min(2, Math.max(0, temperature));
-        const thinking = getPref("thinking") === "disabled" ? "disabled" : "standard";
-        return { maxTokens, temperature, thinking };
+        const thinking = getPref("thinking") === "standard" ? "standard" : "disabled";
+        return { answerTokens, temperature, thinking };
     },
 
     _normalizeContent(content) {
@@ -527,18 +540,20 @@ const ApiClient = {
         ].join(", ");
     },
 
-    async query(questionText, contextText, pdfExcerpts, history) {
+    async query(questionText, contextText, pdfExcerpts, history, onStatus) {
         const endpoint = getPref("apiEndpoint");
         const model = getPref("model");
         const mode = getAnswerMode();
         const request = this._buildMessages(questionText, contextText, mode, pdfExcerpts, history);
         const settings = this._resolveSettings(mode);
+        const headroom = settings.thinking === "standard" ? CONFIG.thinkingHeadroomTokens : 0;
 
         Zotero.debug(
             "[PaperPartner] API request: host=" + getEndpointHost(endpoint) +
             ", model=" + model +
             ", mode=" + mode +
-            ", max_tokens=" + settings.maxTokens +
+            ", answer_max_tokens=" + settings.answerTokens +
+            ", thinking_headroom=" + headroom +
             ", temperature=" + settings.temperature +
             ", thinking=" + settings.thinking +
             ", message_count=" + request.messages.length +
@@ -546,15 +561,18 @@ const ApiClient = {
             ", history_chars=" + (history ? history.length : 0)
         );
 
-        // One automatic retry with a doubled token budget when the response
-        // was cut off (reasoning models can spend the whole budget thinking).
-        let limit = settings.maxTokens;
+        // One automatic retry with a doubled answer budget when the response
+        // was cut off (this is the "if more tokens are needed, raise them" path).
+        let answerLimit = settings.answerTokens;
         for (let attempt = 0; ; attempt++) {
-            const r = await this._call(endpoint, model, request, limit, settings.temperature, settings.thinking);
+            const r = await this._call(endpoint, model, request, headroom + answerLimit, settings.temperature, settings.thinking);
             if (r.ok) return r.content;
-            if (!(r.retryable && attempt === 0 && limit < 32768)) throw new Error(r.error);
-            limit = Math.min(limit * 2, 32768);
-            Zotero.debug("[PaperPartner] Retrying with max_tokens=" + limit + ": " + r.error);
+            if (!(r.retryable && attempt === 0 && answerLimit < 32768)) throw new Error(r.error);
+            answerLimit *= 2;
+            Zotero.debug("[PaperPartner] Retrying with answer budget " + answerLimit + ": " + r.error);
+            if (onStatus) {
+                try { onStatus("首次尝试超出预算，已用加倍额度重试"); } catch (_) {}
+            }
         }
     },
 
@@ -563,70 +581,85 @@ const ApiClient = {
             model,
             messages: request.messages,
             max_tokens: maxTokens,
-            temperature,
         };
+        // Kimi/Moonshot pin temperature to the thinking mode and reject
+        // every other value - omit the field there entirely.
+        const omitTemperature = isTemperaturelessProvider(endpoint);
+        if (!omitTemperature) body.temperature = temperature;
         if (thinking === "disabled") body.thinking = { type: "disabled" };
 
-        let response;
-        try {
-            response = await fetch(endpoint, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${getPref("apiKey")}`,
-                },
-                body: JSON.stringify(body),
-            });
-        } catch (e) {
-            return { ok: false, retryable: false, error: "Network error: " + e.message };
-        }
+        // Timeout floor grows with the answer budget so a long generation
+        // is not killed mid-flight, while a dead connection still aborts.
+        const timeoutMs = Math.max(CONFIG.requestTimeoutMs, maxTokens * (CONFIG.timeoutMsPerToken || 0));
 
-        if (!response.ok) {
-            const errBody = await response.text().catch(() => "");
+        let attempt = 0;
+        while (true) {
+            let xhr;
+            try {
+                xhr = await Zotero.HTTP.request("POST", endpoint, {
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${getPref("apiKey")}`,
+                    },
+                    body: JSON.stringify(body),
+                    responseType: "text",
+                    timeout: timeoutMs,
+                });
+            } catch (e) {
+                if (e instanceof Zotero.HTTP.TimeoutException) {
+                    return { ok: false, retryable: false, error: "Request timed out after " + Math.round(timeoutMs / 1000) + "s" };
+                }
+                if (e instanceof Zotero.HTTP.UnexpectedStatusException) {
+                    const status = e.status;
+                    const errBody = String((e.xmlhttp && e.xmlhttp.responseText) || "").slice(0, 500);
+                    Zotero.debug("[PaperPartner] API HTTP error: status=" + status + ", body=" + errBody);
+                    // Provider pins temperature to the thinking mode:
+                    // drop the field and try once more.
+                    if (attempt === 0 && status === 400 && /invalid temperature/i.test(errBody) && ("temperature" in body)) {
+                        delete body.temperature;
+                        attempt++;
+                        continue;
+                    }
+                    return { ok: false, retryable: false, error: `HTTP ${status}: ${errBody.slice(0, 200)}` };
+                }
+                return { ok: false, retryable: false, error: "Network error: " + (e.message || e) };
+            }
+
+            let data;
+            try {
+                data = JSON.parse(xhr.responseText);
+            } catch (e) {
+                Zotero.debug("[PaperPartner] API JSON parse error: " + e.message + ", body=" + String(xhr.responseText || "").slice(0, 200));
+                return { ok: false, retryable: false, error: "Invalid JSON from API" };
+            }
+
+            const choice = data && data.choices && data.choices[0];
+            const message = choice && choice.message;
+            const content = message ? this._normalizeContent(message.content) : "";
+            const finishReason = choice && choice.finish_reason ? choice.finish_reason : "unknown";
+
+            if (finishReason === "length") {
+                Zotero.debug("[PaperPartner] API hit the token limit: " + this._summarizeChoice(choice));
+                return {
+                    ok: false,
+                    retryable: true,
+                    error: content
+                        ? "Response was cut off by the token limit (finish_reason=length)"
+                        : "Empty response: the token limit was consumed by reasoning (finish_reason=length)",
+                };
+            }
+
+            if (!content) {
+                Zotero.debug("[PaperPartner] Empty API response: " + this._summarizeChoice(choice));
+                return { ok: false, retryable: false, error: "Empty response from API (finish_reason=" + finishReason + ")" };
+            }
+
             Zotero.debug(
-                "[PaperPartner] API HTTP error: host=" + getEndpointHost(endpoint) +
-                ", model=" + model +
-                ", status=" + response.status +
-                ", body=" + errBody.slice(0, 500)
+                "[PaperPartner] API response OK: finish_reason=" + finishReason +
+                ", content_length=" + content.length
             );
-            return { ok: false, retryable: false, error: `HTTP ${response.status}: ${errBody.slice(0, 200)}` };
+            return { ok: true, content };
         }
-
-        let data;
-        try {
-            data = await response.json();
-        } catch (e) {
-            Zotero.debug("[PaperPartner] API JSON parse error: " + e.message);
-            return { ok: false, retryable: false, error: "Invalid JSON from API" };
-        }
-
-        const choice = data && data.choices && data.choices[0];
-        const message = choice && choice.message;
-        const content = message ? this._normalizeContent(message.content) : "";
-        const finishReason = choice && choice.finish_reason ? choice.finish_reason : "unknown";
-
-        if (finishReason === "length") {
-            Zotero.debug("[PaperPartner] API hit the token limit: " + this._summarizeChoice(choice));
-            return {
-                ok: false,
-                retryable: true,
-                error: content
-                    ? "Response was cut off by the token limit (finish_reason=length)"
-                    : "Empty response: the token limit was consumed by reasoning (finish_reason=length)",
-            };
-        }
-
-        if (!content) {
-            Zotero.debug("[PaperPartner] Empty API response: " + this._summarizeChoice(choice));
-            return { ok: false, retryable: false, error: "Empty response from API (finish_reason=" + finishReason + ")" };
-        }
-
-        Zotero.debug(
-            "[PaperPartner] API response OK: status=" + response.status +
-            ", finish_reason=" + finishReason +
-            ", content_length=" + content.length
-        );
-        return { ok: true, content };
     },
 };
 
@@ -721,15 +754,18 @@ async function processQuestion(item, q) {
 
     Zotero.debug("[PaperPartner] → Q: " + questionText.slice(0, 80));
 
-    // ① Mark as running (API call about to start)
-    await NoteWriter.write(item, el, "running");
+    // ① reading: locate the PDF full text (may index on first use)
+    await NoteWriter.write(item, el, "reading");
+    const onReadingHint = hint => NoteWriter.write(item, el, "reading", hint).catch(() => {});
 
-    // ② Call the model
+    // ② thinking: call the model (may retry with a doubled budget)
     let answer;
     try {
-        const pdfExcerpts = await PdfContext.collect(item, questionText, contextText);
+        const pdfExcerpts = await PdfContext.collect(item, questionText, contextText, onReadingHint);
         const history = NoteParser.buildHistory(NoteParser.parse(item.getNote()), q.index);
-        answer = await ApiClient.query(questionText, contextText, pdfExcerpts, history);
+        await NoteWriter.write(item, el, "thinking");
+        answer = await ApiClient.query(questionText, contextText, pdfExcerpts, history,
+            hint => NoteWriter.write(item, el, "thinking", hint).catch(() => {}));
     } catch (e) {
         Zotero.debug("[PaperPartner] API error: " + e.message);
         await NoteWriter.write(item, el, "error", e.message.slice(0, 120));

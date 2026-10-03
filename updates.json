@@ -3,8 +3,8 @@
     "paper-partner@qinsihan.github.io": {
       "updates": [
         {
-          "version": "0.1.1",
-          "update_link": "https://github.com/QinSihan/zotero-paper-partner/releases/download/v0.1.1/paper-partner.xpi",
+          "version": "0.1.7",
+          "update_link": "https://raw.githubusercontent.com/imxiaotaoya/zotero-paper-partner/main/dist/paper-partner-0.1.7.xpi",
           "applications": {
             "zotero": {
               "strict_min_version": "7.0",
