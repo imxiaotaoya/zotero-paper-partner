@@ -203,7 +203,7 @@ const NoteWriter = {
 const ApiClient = {
     _modes: {
         brief: {
-            maxTokens: 300,
+            maxTokens: 1200,
             systemPrompt:
                 "You are a quiet reading assistant embedded in a Zotero note. " +
                 "Give a compact answer that can be inserted directly below the user's question. " +
@@ -215,7 +215,7 @@ const ApiClient = {
                 "The local note excerpt may be truncated to 2000 characters. Keep your answer within 300 output tokens.",
         },
         detailed: {
-            maxTokens: 1500,
+            maxTokens: 3000,
             systemPrompt:
                 "You are a careful academic reading assistant embedded in a Zotero note. " +
                 "Help the reader genuinely understand the specific point they asked about. " +
@@ -301,7 +301,7 @@ const ApiClient = {
                 model,
                 messages: request.messages,
                 max_tokens: request.maxTokens,
-                temperature: 0.3,
+                temperature: 1,
             }),
         });
 
