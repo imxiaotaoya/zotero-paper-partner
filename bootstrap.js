@@ -205,6 +205,7 @@ const NoteWriter = {
 // ============================================================
 const PdfContext = {
     maxTextChars: 400000,
+    maxFullChars: 50000,
     maxChars: 4500,
     chunkTarget: 1200,
     maxChunks: 4,
@@ -278,8 +279,13 @@ const PdfContext = {
                 Zotero.debug("[PaperPartner] PDF context: no usable fulltext (chars=" + (text ? text.length : 0) + ")");
                 return "";
             }
-            const out = this._select(text.slice(0, this.maxTextChars), questionText, contextText);
-            Zotero.debug("[PaperPartner] PDF context: source_chars=" + text.length + ", excerpt_chars=" + out.length);
+            const prepared = this._markPages(text).slice(0, this.maxTextChars);
+            if (prepared.length <= this.maxFullChars) {
+                Zotero.debug("[PaperPartner] PDF context: full text attached (chars=" + prepared.length + ")");
+                return prepared;
+            }
+            const out = this._select(prepared, questionText, contextText);
+            Zotero.debug("[PaperPartner] PDF context: source_chars=" + prepared.length + ", excerpt_chars=" + out.length);
             return out;
         } catch (e) {
             Zotero.debug("[PaperPartner] PDF context unavailable: " + e.message);
@@ -333,6 +339,10 @@ const PdfContext = {
             }
         }
         return (typeof text === "string") ? text : "";
+    },
+
+    _markPages(text) {
+        return String(text).replace(/(^|\n)\s*(\d{1,4})\s*(?=\n|$)/g, "$1[page $2]\n");
     },
 
     _select(text, questionText, contextText) {
@@ -409,7 +419,7 @@ const ApiClient = {
                 { role: "user", content: config.userInstruction },
                 ...(pdfExcerpts ? [{
                     role: "user",
-                    content: "Excerpts from the PDF that this note is attached to (selected automatically; may be incomplete):\n\n"
+                    content: "Text from the PDF that this note is attached to (either the complete document with page markers like [page 3], or automatically selected excerpts):\n\n"
                         + pdfExcerpts
                         + "\n\nUse these excerpts when they help answer the question. If the answer is not in them, say so from general knowledge without claiming the PDF contains it.",
                 }] : []),
